@@ -89,10 +89,11 @@ type Result struct {
 	FixAttempts []FixAttempt `json:"fix_attempts,omitempty"`
 	Covered     bool         `json:"covered"` // exercitada pelos testes do pacote
 	Passed      bool         `json:"passed"`  // testes do pacote passaram com o código gerado
-	Truncated   bool         `json:"truncated,omitempty"`
-	InfraError  bool         `json:"infra_error,omitempty"`
-	ElapsedMs   int64        `json:"elapsed_ms,omitempty"`
-	Error       string       `json:"error,omitempty"`
+	Truncated       bool         `json:"truncated,omitempty"`
+	PromptEvalCount int          `json:"prompt_eval_count,omitempty"`
+	InfraError      bool         `json:"infra_error,omitempty"`
+	ElapsedMs       int64        `json:"elapsed_ms,omitempty"`
+	Error           string       `json:"error,omitempty"`
 }
 
 // Report resume a rodada.
@@ -236,8 +237,10 @@ func Run(ctx context.Context, st *store.Store, opts Options) (*Report, error) {
 				} else if opts.Model == OriginalModel {
 					r.Answer, err = task.Original, nil
 				} else {
-					r.Answer, truncated, err = chat(ctx, opts, SystemPrompt, task.Prompt)
+					var promptEval int
+					r.Answer, truncated, promptEval, err = chat(ctx, opts, SystemPrompt, task.Prompt)
 					inferMs = time.Since(fnStart).Milliseconds()
+					r.PromptEvalCount = promptEval
 					if truncated {
 						r.Truncated = true
 					}
@@ -269,7 +272,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) (*Report, error) {
 					var answer string
 					var cerr error
 					if truncated {
-						answer, truncated, cerr = chat(ctx, opts, SystemPrompt, task.Prompt)
+						answer, truncated, _, cerr = chat(ctx, opts, SystemPrompt, task.Prompt)
 					} else {
 						prompt := ""
 						if trigger == "test" {
@@ -277,7 +280,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) (*Report, error) {
 						} else {
 							prompt = FixPrompt(task.Prompt, r.Code, r.Errors)
 						}
-						answer, truncated, cerr = chat(ctx, opts, FixSystemPrompt, prompt)
+						answer, truncated, _, cerr = chat(ctx, opts, FixSystemPrompt, prompt)
 					}
 					inferMs += time.Since(tStart).Milliseconds()
 					if cerr != nil {
@@ -663,7 +666,7 @@ func (e *infraErr) Error() string { return e.err.Error() }
 func (e *infraErr) Unwrap() error { return e.err }
 
 // chat pede a função ao modelo, sem restrição de formato.
-func chat(ctx context.Context, opts Options, system, prompt string) (string, bool, error) {
+func chat(ctx context.Context, opts Options, system, prompt string) (string, bool, int, error) {
 	body, _ := json.Marshal(map[string]any{
 		"model":  opts.Model,
 		"stream": false,
@@ -676,7 +679,7 @@ func chat(ctx context.Context, opts Options, system, prompt string) (string, boo
 			"temperature":    0,
 			"top_p":          1,
 			"repeat_penalty": 1.05,
-			"num_ctx":        8192,
+			"num_ctx":        10240,
 			"num_predict":    1000,
 			"seed":           42,
 		},
@@ -689,19 +692,19 @@ func chat(ctx context.Context, opts Options, system, prompt string) (string, boo
 			wait := time.Duration(1<<(attempt-1)) * time.Second
 			select {
 			case <-ctx.Done():
-				return "", false, ctx.Err()
+				return "", false, 0, ctx.Err()
 			case <-time.After(wait):
 			}
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
-			return "", false, err
+			return "", false, 0, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
-				return "", false, ctx.Err()
+				return "", false, 0, ctx.Err()
 			}
 			lastErr = &infraErr{err: err}
 			continue
@@ -717,18 +720,19 @@ func chat(ctx context.Context, opts Options, system, prompt string) (string, boo
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return "", false, fmt.Errorf("ollama: %s: %s", resp.Status, strings.TrimSpace(string(data)))
+			return "", false, 0, fmt.Errorf("ollama: %s: %s", resp.Status, strings.TrimSpace(string(data)))
 		}
 		var out struct {
-			DoneReason string `json:"done_reason"`
-			Message    struct {
+			DoneReason      string `json:"done_reason"`
+			PromptEvalCount int    `json:"prompt_eval_count"`
+			Message         struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		}
 		if err := json.Unmarshal(data, &out); err != nil {
-			return "", false, fmt.Errorf("ollama: resposta inválida: %w", err)
+			return "", false, 0, fmt.Errorf("ollama: resposta inválida: %w", err)
 		}
-		return out.Message.Content, out.DoneReason == "length", nil
+		return out.Message.Content, out.DoneReason == "length", out.PromptEvalCount, nil
 	}
-	return "", false, lastErr
+	return "", false, 0, lastErr
 }
