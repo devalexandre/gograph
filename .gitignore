@@ -1,0 +1,16 @@
+bin/
+.gograph/
+corpus/
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+.venv*
+train/.venv/
+train/out/
+train/data/
+__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+
